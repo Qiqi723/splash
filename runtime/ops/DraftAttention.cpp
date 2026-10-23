@@ -113,7 +113,7 @@ DraftAttentionWorkspace DraftAttentionPlan::workspace() const noexcept {
   const uint64_t kvBytes = rows * shape_.kvHeads * shape_.headDimension * 2;
   const uint64_t attentionRows = rows * shape_.queryHeads / shape_.kvHeads;
   const uint64_t partialBytes =
-      uint64_t{lanes_} * shape_.kvHeads * kSplits *
+      uint64_t{shape_.kvHeads} * kSplits *
       (attentionRows * shape_.headDimension + 2 * attentionRows) * sizeof(float);
   return {rows * shape_.hiddenSize * 2, rows * shape_.qkvSize * 2,
           rows * shape_.attentionSize * 2 + partialBytes, kvBytes, kvBytes};

@@ -20,16 +20,6 @@ void requireLayout(const DFlashDraftLayout &layout) {
       !layout.kvHeads || !layout.queryRows || !layout.queryHeads) {
     throw WeightStoreError("DFlash draft layout contains a zero dimension");
   }
-  const bool legacy = layout.queryRows == SPLASH_DRAFT_QUERY_ROWS &&
-                      layout.queryHeads == SPLASH_DRAFT_QUERY_HEADS &&
-                      layout.kvHeads == SPLASH_DRAFT_KV_HEADS &&
-                      layout.attentionHeadDimension == SPLASH_DRAFT_HEAD_DIMENSION;
-  const bool qwen4 = layout.queryRows == SPLASH_DRAFT4_QUERY_ROWS &&
-                     layout.queryHeads == SPLASH_DRAFT4_QUERY_HEADS &&
-                     layout.kvHeads == SPLASH_DRAFT4_KV_HEADS &&
-                     layout.attentionHeadDimension == SPLASH_DRAFT4_HEAD_DIMENSION;
-  if (!legacy && !qwen4)
-    throw WeightStoreError("DFlash draft attention shape is not compiled");
   if (layout.selectorRank != SPLASH_DRAFT_SELECTOR_RANK) {
     throw WeightStoreError("draft selector kernels are compiled for rank " +
                            std::to_string(SPLASH_DRAFT_SELECTOR_RANK));
@@ -94,6 +84,16 @@ DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint
   if (!attentionSize || !kvSize || attentionSize > UINT32_MAX ||
       attentionSize + 2 * kvSize > UINT32_MAX)
     throw std::invalid_argument("a DFlash2 draft attention width is invalid");
+  const bool legacy = attention.queryRows == SPLASH_DRAFT_QUERY_ROWS &&
+                      attention.queryHeads == SPLASH_DRAFT_QUERY_HEADS &&
+                      attention.kvHeads == SPLASH_DRAFT_KV_HEADS &&
+                      attention.headDimension == SPLASH_DRAFT_HEAD_DIMENSION;
+  const bool qwen4 = attention.queryRows == SPLASH_DRAFT4_QUERY_ROWS &&
+                     attention.queryHeads == SPLASH_DRAFT4_QUERY_HEADS &&
+                     attention.kvHeads == SPLASH_DRAFT4_KV_HEADS &&
+                     attention.headDimension == SPLASH_DRAFT4_HEAD_DIMENSION;
+  if (!legacy && !qwen4)
+    throw std::invalid_argument("DFlash draft attention shape is not compiled");
   DFlashDraftLayout layout{.layers = layers,
                            .hiddenSize = hiddenSize,
                            .vocabularySize = vocabularySize,

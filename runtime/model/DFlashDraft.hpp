@@ -87,8 +87,8 @@ struct DFlashDraftLayout final {
   uint32_t kvHeads = 0;
   // The rows one draft forward evaluates together. A 16-row Qwen3.5 block
   // still verifies the first eight rows in this runtime version.
-  uint32_t queryRows = 0;
-  uint32_t queryHeads = 0;
+  uint32_t queryRows = SPLASH_DRAFT_QUERY_ROWS;
+  uint32_t queryHeads = SPLASH_DRAFT_QUERY_HEADS;
   // The target layers whose output rows the draft reads, ascending: the
   // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};

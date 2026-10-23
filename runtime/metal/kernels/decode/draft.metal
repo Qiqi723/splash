@@ -575,9 +575,9 @@ DRAFT_ATTENTION_QKV_KERNEL(draft_attention_qkv_kv4_h256,
   kernel void Name(                                                               \
       device bfloat *queries [[buffer(0)]],                                       \
       constant DraftAttentionBatchParams &params [[buffer(1)]],                   \
-      uint2 group [[threadgroup_position_in_grid]],                               \
+      uint3 group [[threadgroup_position_in_grid]],                               \
       uint thread_index [[thread_index_in_threadgroup]],                          \
-      uint threads [[threads_per_threadgroup]]) {                                 \
+      uint3 threads [[threads_per_threadgroup]]) {                                \
     constexpr uint AttentionM = QHeads / KVHeads * Rows;                          \
     constexpr ulong BlockRows = Rows, Attention = QHeads * HeadDim,               \
                     DV = HeadDim,                                                 \
@@ -592,7 +592,7 @@ DRAFT_ATTENTION_QKV_KERNEL(draft_attention_qkv_kv4_h256,
         partials,                                                                 \
         queries + batch * BlockRows * Attention +                                 \
             group.x * AttentionM * DV,                                            \
-        thread_index, threads);                                                   \
+        thread_index, threads.x);                                                 \
   }
 
 DRAFT_ATTENTION_SPLIT_KERNEL(draft_attention_bf16_split,
