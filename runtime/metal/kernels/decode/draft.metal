@@ -165,7 +165,8 @@ inline void draft_attention_split_phase(
   constexpr ushort M = QueryHeads / KVHeads * Rows,
                    N = M > 32 ? 64 : 128, D = HeadDim, TileK = 64;
   constexpr uint Window = SPLASH_DRAFT_SLIDING_WINDOW,
-                 Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+                 Splits = SPLASH_DRAFT_ATTENTION_SPLITS,
+                 ScoreColumns = N / 32;
   constexpr float Scale = HeadDim == 128 ? 0.08838834765f : 0.0625f;
   uint common_start =
       cache_length >= Window - 1 ? cache_length - (Window - 1) : 0;
@@ -242,7 +243,7 @@ inline void draft_attention_split_phase(
       uint hidden_prefix = row_start - common_start;
       float local_scores[4];
       float tile_max = -INFINITY;
-      for (ushort i = 0; i < 4; ++i) {
+      for (ushort i = 0; i < ScoreColumns; ++i) {
         uint column = lane + i * 32;
         uint key = slot + column;
         uint logical_key = key >= physical_start
@@ -260,7 +261,7 @@ inline void draft_attention_split_phase(
       bool empty = next_max == -INFINITY;
       float scale = empty ? 1.0f : fast::exp(row_max[matrix_row] - next_max);
       float tile_sum = 0.0f;
-      for (ushort i = 0; i < 4; ++i) {
+      for (ushort i = 0; i < ScoreColumns; ++i) {
         local_scores[i] = empty ? 0.0f : fast::exp(local_scores[i] - next_max);
         tile_sum += local_scores[i];
       }
@@ -270,7 +271,7 @@ inline void draft_attention_split_phase(
         row_sum[matrix_row] = row_sum[matrix_row] * scale + tile_sum;
         row_max[matrix_row] = next_max;
       }
-      for (ushort i = 0; i < 4; ++i) {
+      for (ushort i = 0; i < ScoreColumns; ++i) {
         uint column = lane + i * 32;
         score_storage[matrix_row * N + column] = local_scores[i];
       }

@@ -48,8 +48,6 @@ constexpr uint32_t kLanes = 4;
 constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
 constexpr uint64_t kPartialBytes = uint64_t{32} * 130 * sizeof(float);
 constexpr uint32_t kAttention = kKvHeads * kQueryHeadsPerKv * kHeadDim;
-constexpr uint32_t kGroupRows = kQueryHeadsPerKv * kRows;
-constexpr float kScale = 0.08838834765F;
 
 // The drafts of Qwen3.8-27B, Qwen3.8-Flash-Next and Qwen3.6-35B-A3B: one
 // convolution kernel takes every hidden width.
@@ -57,6 +55,8 @@ constexpr std::array kShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
     DraftAttentionShape{2560, 640, 6144, 4096, 32, 8, 128},
     DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
+constexpr DraftAttentionShape kQwen35FourBShape{
+    2560, 640, 6144, 4096, 16, 4, 256, 16};
 
 using splash::test::rejects;
 using splash::test::require;
@@ -86,62 +86,68 @@ MetalBuffer randomBfloat(MetalBackend &backend, uint64_t count, Random &random,
 
 // Reference for one lane and kv head: every row attends to the ring window it
 // can see plus all eight current rows, exactly as the kernel's mask defines.
-void referenceRows(const uint16_t *queries, const uint16_t *keys,
+void referenceRows(DraftAttentionShape shape, const uint16_t *queries,
+                   const uint16_t *keys,
                    const uint16_t *values, const uint16_t *queryKeys,
                    const uint16_t *queryValues, uint32_t cacheLength,
                    std::vector<float> &output) {
+  const uint32_t rows = shape.queryRows;
+  const uint32_t headDim = shape.headDimension;
+  const uint32_t groupRows =
+      shape.queryHeads / shape.kvHeads * rows;
+  const double scale = 1.0 / std::sqrt(double(headDim));
   const uint32_t commonStart =
       cacheLength >= kWindow - 1 ? cacheLength - (kWindow - 1) : 0;
   const uint32_t oldCount = cacheLength - commonStart;
-  std::vector<double> scores(oldCount + kRows);
-  std::vector<double> accumulated(kHeadDim);
-  for (uint32_t row = 0; row < kGroupRows; ++row) {
-    const uint32_t proposal = row % kRows;
+  std::vector<double> scores(oldCount + rows);
+  std::vector<double> accumulated(headDim);
+  for (uint32_t row = 0; row < groupRows; ++row) {
+    const uint32_t proposal = row % rows;
     const uint32_t queryPosition = cacheLength + proposal;
     const uint32_t rowStart =
         queryPosition >= kWindow - 1 ? queryPosition - (kWindow - 1) : 0;
     const uint32_t hiddenPrefix = rowStart - commonStart;
-    const uint16_t *query = queries + uint64_t{row} * kHeadDim;
+    const uint16_t *query = queries + uint64_t{row} * headDim;
     double best = -INFINITY;
-    for (uint32_t key = 0; key < oldCount + kRows; ++key) {
+    for (uint32_t key = 0; key < oldCount + rows; ++key) {
       double score = -INFINITY;
       if (key >= oldCount) {
         const uint32_t current = key - oldCount;
         double dot = 0.0;
-        for (uint32_t d = 0; d < kHeadDim; ++d) {
+        for (uint32_t d = 0; d < headDim; ++d) {
           dot += double(bf16ToFloat(query[d])) *
-                 bf16ToFloat(queryKeys[current * kHeadDim + d]);
+                 bf16ToFloat(queryKeys[current * headDim + d]);
         }
-        score = dot * kScale;
+        score = dot * scale;
       } else if (key >= hiddenPrefix) {
         const uint32_t slot = (commonStart + key) % kWindow;
         double dot = 0.0;
-        for (uint32_t d = 0; d < kHeadDim; ++d) {
+        for (uint32_t d = 0; d < headDim; ++d) {
           dot += double(bf16ToFloat(query[d])) *
-                 bf16ToFloat(keys[uint64_t{slot} * kHeadDim + d]);
+                 bf16ToFloat(keys[uint64_t{slot} * headDim + d]);
         }
-        score = dot * kScale;
+        score = dot * scale;
       }
       scores[key] = score;
       best = std::max(best, score);
     }
     double sum = 0.0;
     std::fill(accumulated.begin(), accumulated.end(), 0.0);
-    for (uint32_t key = 0; key < oldCount + kRows; ++key) {
+    for (uint32_t key = 0; key < oldCount + rows; ++key) {
       if (scores[key] == -INFINITY)
         continue;
       const double probability = std::exp(scores[key] - best);
       sum += probability;
-      for (uint32_t d = 0; d < kHeadDim; ++d) {
+      for (uint32_t d = 0; d < headDim; ++d) {
         const float value =
             key >= oldCount
-                ? bf16ToFloat(queryValues[uint64_t{d} * kRows + key - oldCount])
+                ? bf16ToFloat(queryValues[uint64_t{d} * rows + key - oldCount])
                 : bf16ToFloat(values[uint64_t{d} * kWindow + (commonStart + key) % kWindow]);
         accumulated[d] += probability * value;
       }
     }
-    for (uint32_t d = 0; d < kHeadDim; ++d)
-      output[uint64_t{row} * kHeadDim + d] =
+    for (uint32_t d = 0; d < headDim; ++d)
+      output[uint64_t{row} * headDim + d] =
           static_cast<float>(accumulated[d] / sum);
   }
 }
@@ -149,7 +155,12 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
 void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
              const std::array<uint32_t, kLanes> &cacheLengths) {
   Random random(0x5eed0000ULL + cacheLengths[0]);
-  const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
+  const uint32_t rows = shape.queryRows;
+  const uint32_t kvHeads = shape.kvHeads;
+  const uint32_t headDim = shape.headDimension;
+  const uint32_t attention = shape.queryHeads * headDim;
+  const uint32_t groupRows = shape.queryHeads / kvHeads * rows;
+  const uint64_t ringElements = uint64_t{kvHeads} * kWindow * headDim;
   // The grouped-queries tensor is sized by the plan so the split partials
   // behind the query rows end exactly at the allocation under validation.
   MetalBuffer queries = randomBfloat(
@@ -161,7 +172,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   // NaN. Shader validation does not see the MPP loads of a tile that reads
   // past the ring, but a masked NaN value still reaches its row as
   // 0 x NaN, which the finiteness check below rejects.
-  const uint64_t tailElements = uint64_t{128} * kHeadDim;
+  const uint64_t tailElements = uint64_t{128} * headDim;
   for (uint32_t lane = 0; lane < kLanes; ++lane) {
     keys.push_back(randomBfloat(backend, ringElements + tailElements, random,
                                 "draft keys"));
@@ -172,15 +183,15 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
                   tailElements, uint16_t{0x7FC0});
   }
   MetalBuffer queryKeys = randomBfloat(
-      backend, uint64_t{lanes} * kKvHeads * kRows * kHeadDim, random,
+      backend, uint64_t{lanes} * kvHeads * rows * headDim, random,
       "draft query keys");
   MetalBuffer queryValues = randomBfloat(
-      backend, uint64_t{lanes} * kKvHeads * kHeadDim * kRows, random,
+      backend, uint64_t{lanes} * kvHeads * headDim * rows, random,
       "draft query values");
   std::vector<uint16_t> input(
       static_cast<const uint16_t *>(queries.contents()),
       static_cast<const uint16_t *>(queries.contents()) +
-          uint64_t{lanes} * kRows * kAttention);
+          uint64_t{lanes} * rows * attention);
 
   CommandGraph graph;
   DraftAttention::addDecode(graph,
@@ -188,10 +199,10 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
       std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
   const auto dispatches = graph.dispatches();
   require(dispatches.size() == 2 &&
-              dispatches[0].threadgroups.x == kKvHeads &&
+              dispatches[0].threadgroups.x == kvHeads &&
               dispatches[0].threadgroups.y == lanes &&
               dispatches[0].threadgroups.z == kSplits &&
-              dispatches[1].threadgroups.x == kKvHeads &&
+              dispatches[1].threadgroups.x == kvHeads &&
               dispatches[1].threadgroups.y == lanes &&
               dispatches[1].threadgroups.z == 1,
           "draft attention core dispatch changed");
@@ -209,24 +220,25 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   require(mismatched.empty(), "mismatched cache lengths encoded a graph");
 
   const auto *output = static_cast<const uint16_t *>(queries.contents());
-  std::vector<float> reference(uint64_t{kGroupRows} * kHeadDim);
+  std::vector<float> reference(uint64_t{groupRows} * headDim);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     // Reference the first and final head, whose ring the NaN tile follows;
     // all eight execute above.
-    for (const uint32_t head : {0U, kKvHeads - 1}) {
+    for (const uint32_t head : {0U, kvHeads - 1}) {
       const uint64_t queryOffset =
-          uint64_t{lane} * kRows * kAttention + uint64_t{head} * kGroupRows *
-                                                    kHeadDim;
+          uint64_t{lane} * rows * attention +
+          uint64_t{head} * groupRows * headDim;
       referenceRows(
+          shape,
           input.data() + queryOffset,
           static_cast<const uint16_t *>(keys[lane].contents()) +
-              uint64_t{head} * kWindow * kHeadDim,
+              uint64_t{head} * kWindow * headDim,
           static_cast<const uint16_t *>(values[lane].contents()) +
-              uint64_t{head} * kWindow * kHeadDim,
+              uint64_t{head} * kWindow * headDim,
           static_cast<const uint16_t *>(queryKeys.contents()) +
-              (uint64_t{lane} * kKvHeads + head) * kRows * kHeadDim,
+              (uint64_t{lane} * kvHeads + head) * rows * headDim,
           static_cast<const uint16_t *>(queryValues.contents()) +
-              (uint64_t{lane} * kKvHeads + head) * kHeadDim * kRows,
+              (uint64_t{lane} * kvHeads + head) * headDim * rows,
           cacheLengths[lane], reference);
       for (uint64_t index = 0; index < reference.size(); ++index) {
         const float actual = bf16ToFloat(output[queryOffset + index]);
@@ -235,8 +247,8 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
             std::fabs(actual - expected) >
                 0.02F + 0.02F * std::fabs(expected)) {
           std::cerr << "lane " << lane << " head " << head << " length "
-                    << cacheLengths[lane] << " row " << index / kHeadDim
-                    << " dim " << index % kHeadDim << ": " << actual
+                    << cacheLengths[lane] << " row " << index / headDim
+                    << " dim " << index % headDim << ": " << actual
                     << " vs " << expected << '\n';
           throw std::runtime_error("draft attention diverged from reference");
         }
@@ -246,26 +258,35 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
 }
 
 void planGeometry() {
-  for (const auto shape : kShapes) {
+  const auto checkShape = [](DraftAttentionShape shape) {
     for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
-      const uint64_t rows = uint64_t{lanes} * kRows;
+      const uint64_t rows = uint64_t{lanes} * shape.queryRows;
+      const uint64_t attentionRows =
+          uint64_t{shape.queryHeads / shape.kvHeads} * shape.queryRows;
+      const uint64_t partialBytes =
+          attentionRows * (shape.headDimension + 2) * sizeof(float);
       const auto plan = DraftAttention::plan(shape, lanes);
       const auto workspace = plan.workspace();
       require(plan.lanes() == lanes && plan.shape() == shape &&
                   workspace.convolutionBytes == rows * shape.hiddenSize * 2 &&
-                  workspace.qkvBytes == rows * 6144 * 2 &&
+                  workspace.qkvBytes == rows * shape.qkvSize * 2 &&
                   workspace.groupedQueriesBytes ==
-                      rows * 4096 * 2 +
-                          uint64_t{lanes} * kKvHeads * kSplits * kPartialBytes &&
-                  workspace.queryKeysBytes == rows * 8 * 128 * 2 &&
-                  workspace.queryValuesBytes == rows * 8 * 128 * 2,
+                      rows * shape.attentionSize * 2 +
+                          uint64_t{lanes} * shape.kvHeads * kSplits *
+                              partialBytes &&
+                  workspace.queryKeysBytes ==
+                      rows * shape.kvHeads * shape.headDimension * 2 &&
+                  workspace.queryValuesBytes ==
+                      rows * shape.kvHeads * shape.headDimension * 2,
               "draft plan padded lanes or changed tensor storage");
     }
     rejects([&] { (void)DraftAttention::plan(shape, 0); }, "invalid draft batch width",
             "a draft plan of no lanes was accepted");
     rejects([&] { (void)DraftAttention::plan(shape, 5); }, "invalid draft batch width",
             "a draft plan wider than a batch was accepted");
-  }
+  };
+  for (const auto shape : kShapes) checkShape(shape);
+  checkShape(kQwen35FourBShape);
   auto unsupported = kShapes[0];
   unsupported.queryHeads = 16;
   rejects([&] { (void)DraftAttention::plan(unsupported, 1); },
@@ -880,6 +901,10 @@ int main(int argc, char **argv) {
       runCase(backend, 4, shape, {2046, 2049, 4095, 4096});
       runCase(backend, 2, shape, {8191, 262144, 0, 0});
     }
+    runCase(backend, 1, kQwen35FourBShape, {0, 0, 0, 0});
+    runCase(backend, 2, kQwen35FourBShape, {31, 32, 0, 0});
+    runCase(backend, 3, kQwen35FourBShape, {127, 128, 129, 0});
+    runCase(backend, 4, kQwen35FourBShape, {2046, 2047, 2048, 2049});
     std::cout << "draft_attention_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

@@ -428,7 +428,7 @@ void DFlashDraft::addDecode(
                              layout.hiddenSize),
            .output = bf16Rows(buffers.intermediate, first, count,
                               layout.intermediateSize),
-           .gateScratch = bf16Rows(buffers.gateScratch, first, count,
+           .gateScratch = bf16Rows(buffers.gateScratch, 0, count,
                                    layout.intermediateSize),
            .scratch = scratch},
           weights.upProjection,
